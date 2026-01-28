@@ -152,7 +152,7 @@ export async function handleTelegramUpdate(
 
   // ---------------- Handle /getprompt command ----------------
   if (userText === "/getprompt") {
-    const prompt = await kvGetPrompt(chatId) ?? dataStore.getPrompt(chatId);
+    const prompt = dataStore.getPrompt(chatId);
     const reply = prompt ? `Current prompt: ${prompt}` : "No prompt set for this chat.";
     await sendTelegramMessage(botToken, chatId, reply);
 

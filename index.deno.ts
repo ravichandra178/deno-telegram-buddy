@@ -12,7 +12,6 @@
 
 import { handleTelegramUpdate, validateWebhookSecret } from "./botController.deno.ts";
 import { dataStore, type MessageRecord } from "./dataStore.deno.ts";
-import { getFullDB } from "./kvStore.deno.ts";
 
 const PORT = parseInt(Deno.env.get("PORT") || "8000");
 
@@ -61,28 +60,38 @@ async function handleRequest(request: Request): Promise<Response> {
   // Admin endpoint - detailed stats
   if (path === "/admin" && method === "GET") {
     try {
-      // Read authoritative DB from disk (db.json). This ensures admin sees
-      // the full persistent history even if KV cache is empty.
-      const db = await getFullDB();
+      const stats = dataStore.getStats();
+      const chats: Record<
+        number,
+        {
+          prompt: string | null;
+          totalMessages: number;
+          recentMessages: MessageRecord[];
+        }
+      > = {};
 
-      // Build admin view
-      const chats: Record<string, any> = {};
-      const chatKeys = Object.keys(db.chats ?? {});
-      for (const cid of chatKeys) {
-        const c = db.chats[cid];
-        chats[cid] = {
-          prompt: c.prompt ?? null,
-          totalMessages: (c.messages ?? []).length,
-          recentMessages: (c.messages ?? []).slice(-10).reverse(), // newest first
-        };
+      // Build per-chat data
+      for (const msg of stats.messages) {
+        const chatId = msg.userId; // using userId as chatId
+        if (!chats[chatId]) {
+          chats[chatId] = {
+            prompt: dataStore.getPrompt(chatId), // now per-chat prompt
+            totalMessages: 0,
+            recentMessages: [],
+          };
+        }
+        chats[chatId].totalMessages += 1;
+        chats[chatId].recentMessages.push(msg);
+        // Keep only last 10 messages per chat
+        if (chats[chatId].recentMessages.length > 10) {
+          chats[chatId].recentMessages.shift();
+        }
       }
 
-      const totalMessages = chatKeys.reduce((acc, k) => acc + ((db.chats[k].messages ?? []).length), 0);
-
       const adminData = {
-        totalMessages,
-        totalUsers: Object.keys(db.chats ?? {}).length, // approximation: number of chats
-        totalChats: chatKeys.length,
+        totalMessages: stats.totalMessages,
+        totalUsers: stats.totalUsers,
+        totalChats: Object.keys(chats).length,
         chats,
       };
 
