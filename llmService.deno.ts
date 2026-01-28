@@ -1,5 +1,5 @@
 /**
- * LLM Service – Groq primary, Gemini fallback
+ * LLM Service – Groq primary, Gemini fallback (safe)
  */
 
 const GEMINI_API_URL =
@@ -19,7 +19,10 @@ async function callGemini(prompt: string): Promise<string> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.7, maxOutputTokens: 1024 },
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 1024,
+      },
     }),
   });
 
@@ -30,7 +33,9 @@ async function callGemini(prompt: string): Promise<string> {
   }
 
   const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error("Empty Gemini response");
+  if (!text || !text.trim()) {
+    throw new Error("Empty Gemini response");
+  }
 
   return text.trim();
 }
@@ -39,10 +44,19 @@ async function callGemini(prompt: string): Promise<string> {
 
 async function callGroq(
   userMessage: string,
-  systemPrompt: string,
+  systemPrompt?: string,
 ): Promise<string> {
   const apiKey = Deno.env.get("GROQ_API_KEY");
   if (!apiKey) throw new Error("GROQ_API_KEY not configured");
+
+  const messages = [];
+
+  // 🚨 IMPORTANT: do NOT send empty system prompt to Groq
+  if (systemPrompt && systemPrompt.trim()) {
+    messages.push({ role: "system", content: systemPrompt });
+  }
+
+  messages.push({ role: "user", content: userMessage });
 
   const res = await fetch(GROQ_API_URL, {
     method: "POST",
@@ -52,19 +66,22 @@ async function callGroq(
     },
     body: JSON.stringify({
       model: GROQ_MODEL,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userMessage },
-      ],
+      messages,
       temperature: 0.7,
     }),
   });
 
-  if (!res.ok) throw new Error(`Groq ${res.status}`);
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Groq ${res.status}: ${err}`);
+  }
 
   const data = await res.json();
   const text = data.choices?.[0]?.message?.content;
-  if (!text) throw new Error("Empty Groq response");
+
+  if (!text || !text.trim()) {
+    throw new Error("Empty Groq response");
+  }
 
   return text.trim();
 }
@@ -79,15 +96,15 @@ export async function generateResponse(
     console.log("⚡ LLM: Groq");
     return await callGroq(userMessage, systemPrompt);
   } catch (groqErr) {
-    console.warn("Groq failed, trying Gemini:", groqErr.message);
+    console.warn("⚠️ Groq failed, trying Gemini:", groqErr.message);
   }
 
   try {
     console.log("🤖 LLM: Gemini");
-    return await callGemini(`${systemPrompt}\n\n${userMessage}`);
+    return await callGemini(`${systemPrompt}\n\nUser: ${userMessage}`);
   } catch (geminiErr) {
-    console.error("Both LLMs failed:", geminiErr.message);
-    return "Sorry, the AI service is currently unavailable.";
+    console.error("❌ Both LLMs failed:", geminiErr.message);
+    return "Sorry, I'm having trouble right now. Please try again later.";
   }
 }
 
@@ -102,12 +119,14 @@ ${instructions}
 Return ONLY the prompt text.`;
 
   try {
-    return await callGroq(metaPrompt, "");
+    console.log("⚡ Prompt LLM: Groq");
+    return await callGroq(metaPrompt);
   } catch {
     try {
+      console.log("🤖 Prompt fallback: Gemini");
       return await callGemini(metaPrompt);
     } catch {
-      return "Error generating prompt.";
+      return "You are a helpful Telegram assistant.";
     }
   }
 }
