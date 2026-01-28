@@ -1,5 +1,6 @@
 /**
  * Telegram Bot Controller - handles updates and commands
+ * Compatible with Groq-only LLM service
  */
 
 import { dataStore, type MessageRecord } from "./dataStore.deno.ts";
@@ -31,6 +32,7 @@ interface TelegramUpdate {
 
 const TELEGRAM_API_BASE = "https://api.telegram.org/bot";
 
+/* ---------------- Send message to Telegram ---------------- */
 async function sendTelegramMessage(
   botToken: string,
   chatId: number,
@@ -41,12 +43,10 @@ async function sendTelegramMessage(
       `${TELEGRAM_API_BASE}${botToken}/sendMessage`,
       {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: chatId,
-          text: text,
+          text,
           parse_mode: "Markdown",
         }),
       }
@@ -65,6 +65,7 @@ async function sendTelegramMessage(
   }
 }
 
+/* ---------------- Handle incoming Telegram updates ---------------- */
 export async function handleTelegramUpdate(
   update: TelegramUpdate,
   botToken: string,
@@ -81,11 +82,11 @@ export async function handleTelegramUpdate(
   const username = message.from?.username ?? null;
   const firstName = message.from?.first_name ?? null;
   const chatId = message.chat.id;
-  const userText = message.text;
+  const userText = message.text.trim();
 
   console.log(`Processing message from ${username || userId}: ${userText}`);
 
-  // Handle /start command
+  // ---------------- Handle /start command ----------------
   if (userText === "/start") {
     const welcomeMessage = `👋 Hello${firstName ? ` ${firstName}` : ""}! I'm an AI-powered bot. Send me any message and I'll respond using advanced language models.`;
     await sendTelegramMessage(botToken, chatId, welcomeMessage);
@@ -103,7 +104,7 @@ export async function handleTelegramUpdate(
     return;
   }
 
-  // Handle /help command
+  // ---------------- Handle /help command ----------------
   if (userText === "/help") {
     const helpMessage = `🤖 *Bot Commands*\n\n/start - Start the bot\n/help - Show this help message\n\nJust send me any text and I'll respond using AI!`;
     await sendTelegramMessage(botToken, chatId, helpMessage);
@@ -121,9 +122,23 @@ export async function handleTelegramUpdate(
     return;
   }
 
-  // Generate LLM response for regular messages
-  const llmResult = await generateResponse(userText, llmApiKey);
-  await sendTelegramMessage(botToken, chatId, llmResult.text);
+  // ---------------- Generate LLM response ----------------
+  let llmResult: string;
+
+  try {
+    llmResult = await generateResponse(userText, llmApiKey);
+  } catch (err) {
+    console.error("❌ LLM generation failed:", err);
+    llmResult = "Sorry, I'm having trouble right now. Please try again shortly.";
+  }
+
+  // Ensure the message is never empty
+  const safeMessage = llmResult && llmResult.trim()
+    ? llmResult.trim()
+    : "Sorry, I'm having trouble right now. Please try again shortly.";
+
+  // Send the response to Telegram
+  await sendTelegramMessage(botToken, chatId, safeMessage);
 
   // Store the interaction
   const record: MessageRecord = {
@@ -132,14 +147,15 @@ export async function handleTelegramUpdate(
     username,
     firstName,
     text: userText,
-    response: llmResult.text,
+    response: safeMessage,
     timestamp: new Date().toISOString(),
   };
   dataStore.addMessage(record);
 
-  console.log(`Processed message for ${username || userId}, success: ${llmResult.success}`);
+  console.log(`Processed message for ${username || userId}, success: true`);
 }
 
+/* ---------------- Validate webhook secret ---------------- */
 export function validateWebhookSecret(
   requestSecret: string | null,
   expectedSecret: string
