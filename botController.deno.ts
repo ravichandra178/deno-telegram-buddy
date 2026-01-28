@@ -1,0 +1,153 @@
+/**
+ * Telegram Bot Controller - handles updates and commands
+ */
+
+import { dataStore, type MessageRecord } from "./dataStore.deno.ts";
+import { generateResponse } from "./llmService.deno.ts";
+
+interface TelegramUser {
+  id: number;
+  is_bot: boolean;
+  first_name: string;
+  last_name?: string;
+  username?: string;
+}
+
+interface TelegramMessage {
+  message_id: number;
+  from?: TelegramUser;
+  chat: {
+    id: number;
+    type: string;
+  };
+  date: number;
+  text?: string;
+}
+
+interface TelegramUpdate {
+  update_id: number;
+  message?: TelegramMessage;
+}
+
+const TELEGRAM_API_BASE = "https://api.telegram.org/bot";
+
+async function sendTelegramMessage(
+  botToken: string,
+  chatId: number,
+  text: string
+): Promise<boolean> {
+  try {
+    const response = await fetch(
+      `${TELEGRAM_API_BASE}${botToken}/sendMessage`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: text,
+          parse_mode: "Markdown",
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("Telegram API error:", response.status, errorText);
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error("Failed to send Telegram message:", error);
+    return false;
+  }
+}
+
+export async function handleTelegramUpdate(
+  update: TelegramUpdate,
+  botToken: string,
+  llmApiKey: string
+): Promise<void> {
+  const message = update.message;
+
+  if (!message || !message.text) {
+    console.log("Received update without text message, skipping");
+    return;
+  }
+
+  const userId = message.from?.id ?? 0;
+  const username = message.from?.username ?? null;
+  const firstName = message.from?.first_name ?? null;
+  const chatId = message.chat.id;
+  const userText = message.text;
+
+  console.log(`Processing message from ${username || userId}: ${userText}`);
+
+  // Handle /start command
+  if (userText === "/start") {
+    const welcomeMessage = `👋 Hello${firstName ? ` ${firstName}` : ""}! I'm an AI-powered bot. Send me any message and I'll respond using advanced language models.`;
+    await sendTelegramMessage(botToken, chatId, welcomeMessage);
+
+    const record: MessageRecord = {
+      id: dataStore.generateId(),
+      userId,
+      username,
+      firstName,
+      text: userText,
+      response: welcomeMessage,
+      timestamp: new Date().toISOString(),
+    };
+    dataStore.addMessage(record);
+    return;
+  }
+
+  // Handle /help command
+  if (userText === "/help") {
+    const helpMessage = `🤖 *Bot Commands*\n\n/start - Start the bot\n/help - Show this help message\n\nJust send me any text and I'll respond using AI!`;
+    await sendTelegramMessage(botToken, chatId, helpMessage);
+
+    const record: MessageRecord = {
+      id: dataStore.generateId(),
+      userId,
+      username,
+      firstName,
+      text: userText,
+      response: helpMessage,
+      timestamp: new Date().toISOString(),
+    };
+    dataStore.addMessage(record);
+    return;
+  }
+
+  // Generate LLM response for regular messages
+  const llmResult = await generateResponse(userText, llmApiKey);
+  await sendTelegramMessage(botToken, chatId, llmResult.text);
+
+  // Store the interaction
+  const record: MessageRecord = {
+    id: dataStore.generateId(),
+    userId,
+    username,
+    firstName,
+    text: userText,
+    response: llmResult.text,
+    timestamp: new Date().toISOString(),
+  };
+  dataStore.addMessage(record);
+
+  console.log(`Processed message for ${username || userId}, success: ${llmResult.success}`);
+}
+
+export function validateWebhookSecret(
+  requestSecret: string | null,
+  expectedSecret: string
+): boolean {
+  if (!expectedSecret) {
+    console.warn("TELEGRAM_WEBHOOK_SECRET not configured, skipping validation");
+    return true;
+  }
+
+  return requestSecret === expectedSecret;
+}
