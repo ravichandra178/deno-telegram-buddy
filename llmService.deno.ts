@@ -1,5 +1,5 @@
 /**
- * LLM Service – Groq ONLY (Gemini disabled due to quota = 0)
+ * LLM Service – Groq ONLY (safe for Telegram, never empty)
  */
 
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
@@ -22,32 +22,39 @@ async function callGroq(
 
   messages.push({ role: "user", content: userMessage });
 
-  const res = await fetch(GROQ_API_URL, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: GROQ_MODEL,
-      messages,
-      temperature: 0.7,
-    }),
-  });
+  try {
+    const res = await fetch(GROQ_API_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages,
+        temperature: 0.7,
+      }),
+    });
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Groq ${res.status}: ${err}`);
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Groq ${res.status}: ${err}`);
+    }
+
+    const data = await res.json();
+    const text = data?.choices?.[0]?.message?.content;
+
+    // 🚨 Prevent empty string
+    if (!text || !text.trim()) {
+      console.warn("⚠️ Groq returned empty response, using fallback message.");
+      return "⚠️ I'm temporarily unavailable. Please try again shortly.";
+    }
+
+    return text.trim();
+  } catch (err: any) {
+    console.error("❌ Groq call failed:", err.message);
+    return "⚠️ I'm temporarily unavailable. Please try again shortly.";
   }
-
-  const data = await res.json();
-  const text = data?.choices?.[0]?.message?.content;
-
-  if (!text || !text.trim()) {
-    throw new Error("Empty Groq response");
-  }
-
-  return text.trim();
 }
 
 /* ===================== PUBLIC API ===================== */
@@ -56,15 +63,7 @@ export async function generateResponse(
   userMessage: string,
   systemPrompt: string,
 ): Promise<string> {
-  try {
-    console.log("⚡ LLM: Groq");
-    return await callGroq(userMessage, systemPrompt);
-  } catch (err) {
-    console.error("❌ Groq failed:", err.message);
-
-    // 🚨 NEVER return empty string (Telegram will 400)
-    return "Sorry, I'm having trouble right now. Please try again in a moment.";
-  }
+  return await callGroq(userMessage, systemPrompt);
 }
 
 /* ===================== PROMPT GENERATOR ===================== */
@@ -78,7 +77,9 @@ ${instructions}
 Return ONLY the prompt text.`;
 
   try {
-    return await callGroq(metaPrompt);
+    const prompt = await callGroq(metaPrompt);
+    // 🚨 fallback if empty
+    return prompt && prompt.trim() ? prompt : "You are a helpful Telegram assistant.";
   } catch {
     return "You are a helpful Telegram assistant.";
   }
