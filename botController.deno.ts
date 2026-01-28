@@ -5,6 +5,7 @@
 
 import { dataStore, type MessageRecord } from "./dataStore.deno.ts";
 import { generateResponse } from "./llmService.deno.ts";
+import { getLastMessages, saveInteraction } from "./kvStore.deno.ts";
 
 interface TelegramUser {
   id: number;
@@ -101,6 +102,9 @@ export async function handleTelegramUpdate(
       timestamp: new Date().toISOString(),
     };
     dataStore.addMessage(record);
+    // Persist the /start interaction into KV memory as well
+    // This helps keep a consistent conversation history per chatId.
+    await saveInteraction(chatId, userId, username, userText, welcomeMessage);
     return;
   }
 
@@ -119,6 +123,8 @@ export async function handleTelegramUpdate(
       timestamp: new Date().toISOString(),
     };
     dataStore.addMessage(record);
+    // Persist the /help interaction into KV memory as well
+    await saveInteraction(chatId, userId, username, userText, helpMessage);
     return;
   }
 
@@ -126,7 +132,26 @@ export async function handleTelegramUpdate(
   let llmResult: string;
 
   try {
-    llmResult = await generateResponse(userText, llmApiKey);
+    // Load last 5 messages for this chat to build the LLM context
+    const history = await getLastMessages(chatId, 5);
+
+    // Build context in the required exact format: "User: ...\nAssistant: ..."
+    // Maintain chronological order (oldest -> newest)
+    let contextParts: string[] = [];
+    for (const item of history) {
+      // Each stored record becomes two lines in the context
+      contextParts.push(`User: ${item.userMessage}`);
+      contextParts.push(`Assistant: ${item.botReply}`);
+    }
+
+    // Append the new user message at the end per requirements
+    contextParts.push(`User: ${userText}`);
+
+    const contextString = contextParts.join("\n");
+
+    // Send the composed context to the LLM service. llmService now expects a single
+    // context string containing the history + new user message.
+    llmResult = await generateResponse(contextString);
   } catch (err) {
     console.error("❌ LLM generation failed:", err);
     llmResult = "Sorry, I'm having trouble right now. Please try again shortly.";
@@ -151,6 +176,10 @@ export async function handleTelegramUpdate(
     timestamp: new Date().toISOString(),
   };
   dataStore.addMessage(record);
+
+  // Persist the interaction into Deno KV memory (keeps last 5 messages per chat)
+  // This runs in parallel but we `await` to ensure pruning happens before next message.
+  await saveInteraction(chatId, userId, username, userText, safeMessage);
 
   console.log(`Processed message for ${username || userId}, success: true`);
 }
