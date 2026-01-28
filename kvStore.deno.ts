@@ -14,6 +14,25 @@ export interface ChatMemoryRecord {
 const CHAT_PREFIX = "chat";
 const DEFAULT_KEEP = 5;
 
+const DB_FILE = "./db.json";
+
+async function loadDB(): Promise<any> {
+  try {
+    const txt = await Deno.readTextFile(DB_FILE);
+    return JSON.parse(txt);
+  } catch (_e) {
+    return { chats: {} };
+  }
+}
+
+async function saveDB(db: any) {
+  try {
+    await Deno.writeTextFile(DB_FILE, JSON.stringify(db, null, 2));
+  } catch (e) {
+    console.warn("Failed to write db.json:", e);
+  }
+}
+
 // Try to open Deno KV if available. Use globalThis to avoid TypeScript problems
 // in environments where Deno types are not present. Do not throw if unavailable.
 let kvClient: any = null;
@@ -56,12 +75,30 @@ export async function saveInteraction(
     botReply,
     timestamp,
   };
+  // 1) Always persist to disk (single source of truth)
+  try {
+    const db = await loadDB();
+    if (!db.chats) db.chats = {};
+    if (!db.chats[chatId]) db.chats[chatId] = { prompt: null, messages: [] };
+    db.chats[chatId].messages.push({
+      id,
+      userId,
+      username,
+      firstName: null,
+      text: userMessage,
+      response: botReply,
+      timestamp,
+    });
+    await saveDB(db);
+  } catch (e) {
+    console.warn("Failed to persist message to db.json:", e);
+  }
 
+  // 2) Try to write to KV (fast cache). If KV fails, use in-memory fallback.
   if (kvClient) {
     try {
       await kvClient.set(buildKey(chatId, timestamp, id), record);
-
-      // Prune older messages beyond `keep`
+      // Prune older messages beyond `keep` in KV
       await pruneOldMessagesKV(chatId, keep);
       return;
     } catch (e) {
@@ -70,7 +107,7 @@ export async function saveInteraction(
     }
   }
 
-  // Fallback: in-memory store
+  // Fallback: in-memory store (acts as cache when KV unavailable)
   const arr = memoryFallback.get(chatId) ?? [];
   arr.push(record);
   // keep only last `keep` entries
@@ -81,6 +118,18 @@ export async function saveInteraction(
 
 /** Persist a per-chat prompt. If KV is available, store there; otherwise store in fallback. */
 export async function setPrompt(chatId: number, prompt: string) {
+  // Persist to disk first (single source of truth)
+  try {
+    const db = await loadDB();
+    if (!db.chats) db.chats = {};
+    if (!db.chats[chatId]) db.chats[chatId] = { prompt: null, messages: [] };
+    db.chats[chatId].prompt = prompt;
+    await saveDB(db);
+  } catch (e) {
+    console.warn("Failed to persist prompt to db.json:", e);
+  }
+
+  // Update KV if available; otherwise update fallback
   if (kvClient) {
     try {
       await kvClient.set(["prompt", chatId], prompt);
@@ -94,29 +143,56 @@ export async function setPrompt(chatId: number, prompt: string) {
 }
 
 export async function getPrompt(chatId: number): Promise<string | null> {
+  // Try KV first
   if (kvClient) {
     try {
       const entry = await kvClient.get(["prompt", chatId]);
-      return entry?.value ?? null;
+      if (entry?.value) return entry.value;
     } catch (e) {
-      console.warn("Deno KV getPrompt failed, using memory fallback:", e);
+      console.warn("Deno KV getPrompt failed, using fallback:", e);
       kvClient = null;
     }
   }
+
+  // Fallback to disk-backed db.json
+  try {
+    const db = await loadDB();
+    const prompt = db.chats?.[chatId]?.prompt ?? null;
+    if (prompt) return prompt;
+  } catch (e) {
+    console.warn("Failed to read db.json for prompt:", e);
+  }
+
   return promptsFallback.get(chatId) ?? null;
 }
 
 export async function clearPrompt(chatId: number) {
+  // Clear from disk
+  try {
+    const db = await loadDB();
+    if (db.chats?.[chatId]) db.chats[chatId].prompt = null;
+    await saveDB(db);
+  } catch (e) {
+    console.warn("Failed to clear prompt in db.json:", e);
+  }
+
   if (kvClient) {
     try {
       await kvClient.delete(["prompt", chatId]);
-      return;
     } catch (e) {
       console.warn("Deno KV clearPrompt failed, using memory fallback:", e);
       kvClient = null;
     }
   }
   promptsFallback.delete(chatId);
+}
+
+export async function getFullDB(): Promise<any> {
+  try {
+    return await loadDB();
+  } catch (_e) {
+    return { chats: {} };
+  }
 }
 
 /** Return last `limit` messages for a chat, ordered oldest -> newest */
@@ -128,13 +204,14 @@ export async function getLastMessages(chatId: number, limit = DEFAULT_KEEP): Pro
       for await (const entry of iter) {
         if (entry?.value) items.push(entry.value as ChatMemoryRecord);
       }
+      // If KV has entries, return the most recent `limit` items
+      if (items.length > 0) {
+        // Sort by timestamp ascending
+        items.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
+        return items.slice(-limit);
+      }
 
-      if (items.length === 0) return [];
-
-      // Sort by timestamp ascending
-      items.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
-
-      return items.slice(-limit);
+      // If KV is empty, fall back to disk DB to populate cache below
     } catch (e) {
       console.warn("Deno KV read failed, using memory fallback:", e);
       kvClient = null;
@@ -142,9 +219,51 @@ export async function getLastMessages(chatId: number, limit = DEFAULT_KEEP): Pro
     }
   }
 
+  // 1) Check in-memory fallback cache
   const arr = memoryFallback.get(chatId) ?? [];
-  // already oldest -> newest, so return last `limit` entries
-  return arr.slice(Math.max(0, arr.length - limit));
+  if (arr.length > 0) return arr.slice(Math.max(0, arr.length - limit));
+
+  // 2) Fallback to db.json (single source of truth) and populate cache/KV
+  try {
+    const db = await loadDB();
+    const history: any[] = db.chats?.[chatId]?.messages ?? [];
+    const last = history.slice(-limit);
+
+    // populate memory fallback and KV for future fast reads
+    for (const msg of last) {
+      const rec: ChatMemoryRecord = {
+        chatId: Number(msg.userId) || Number(chatId),
+        userId: Number(msg.userId) || Number(chatId),
+        username: msg.username ?? null,
+        userMessage: msg.text ?? msg.userMessage ?? "",
+        botReply: msg.response ?? msg.botReply ?? "",
+        timestamp: msg.timestamp,
+      };
+      const cur = memoryFallback.get(chatId) ?? [];
+      cur.push(rec);
+      memoryFallback.set(chatId, cur.slice(-DEFAULT_KEEP));
+
+      if (kvClient) {
+        try {
+          await kvClient.set(buildKey(chatId, rec.timestamp, crypto.randomUUID()), rec);
+        } catch (_e) {
+          // ignore KV set failures here
+        }
+      }
+    }
+
+    return last.map((msg) => ({
+      chatId: Number(msg.userId) || Number(chatId),
+      userId: Number(msg.userId) || Number(chatId),
+      username: msg.username ?? null,
+      userMessage: String(msg.text ?? msg.userMessage ?? ""),
+      botReply: String(msg.response ?? msg.botReply ?? ""),
+      timestamp: String(msg.timestamp),
+    }));
+  } catch (e) {
+    console.warn("Failed to read db.json for fallback:", e);
+    return [];
+  }
 }
 
 async function pruneOldMessagesKV(chatId: number, keep: number) {
