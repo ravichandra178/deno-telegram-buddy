@@ -11,7 +11,7 @@
  */
 
 import { handleTelegramUpdate, validateWebhookSecret } from "./botController.deno.ts";
-import { dataStore } from "./dataStore.deno.ts";
+import { dataStore, type MessageRecord } from "./dataStore.deno.ts";
 
 const PORT = parseInt(Deno.env.get("PORT") || "8000");
 
@@ -23,7 +23,7 @@ const corsHeaders = {
 };
 
 function jsonResponse(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
+  return new Response(JSON.stringify(data, null, 2), {
     status,
     headers: {
       ...corsHeaders,
@@ -49,10 +49,7 @@ async function handleRequest(request: Request): Promise<Response> {
 
   // Handle CORS preflight
   if (method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: corsHeaders,
-    });
+    return new Response(null, { status: 204, headers: corsHeaders });
   }
 
   // Health check endpoint
@@ -60,10 +57,49 @@ async function handleRequest(request: Request): Promise<Response> {
     return textResponse("OK");
   }
 
-  // Admin endpoint
+  // Admin endpoint - detailed stats
   if (path === "/admin" && method === "GET") {
-    const stats = dataStore.getStats();
-    return jsonResponse(stats);
+    try {
+      const stats = dataStore.getStats();
+      const chats: Record<
+        number,
+        {
+          prompt: string | null;
+          totalMessages: number;
+          recentMessages: MessageRecord[];
+        }
+      > = {};
+
+      // Build per-chat data
+      for (const msg of stats.messages) {
+        const chatId = msg.userId; // using userId as chatId
+        if (!chats[chatId]) {
+          chats[chatId] = {
+            prompt: dataStore.getPrompt(chatId), // now per-chat prompt
+            totalMessages: 0,
+            recentMessages: [],
+          };
+        }
+        chats[chatId].totalMessages += 1;
+        chats[chatId].recentMessages.push(msg);
+        // Keep only last 10 messages per chat
+        if (chats[chatId].recentMessages.length > 10) {
+          chats[chatId].recentMessages.shift();
+        }
+      }
+
+      const adminData = {
+        totalMessages: stats.totalMessages,
+        totalUsers: stats.totalUsers,
+        totalChats: Object.keys(chats).length,
+        chats,
+      };
+
+      return jsonResponse(adminData);
+    } catch (err) {
+      console.error("Admin stats error:", err);
+      return jsonResponse({ error: "Failed to retrieve admin stats" }, 500);
+    }
   }
 
   // Telegram webhook endpoint
@@ -79,19 +115,23 @@ async function handleRequest(request: Request): Promise<Response> {
     try {
       const update = await request.json();
       const botToken = Deno.env.get("TELEGRAM_BOT_TOKEN");
-      const llmApiKey = Deno.env.get("LLM_API_KEY");
+      const groqApiKey = Deno.env.get("GROQ_API_KEY"); // ONLY Groq now
 
       if (!botToken) {
         console.error("TELEGRAM_BOT_TOKEN not configured");
         return jsonResponse({ error: "Bot token not configured" }, 500);
       }
 
+      if (!groqApiKey) {
+        console.error("GROQ_API_KEY not configured");
+        return jsonResponse({ error: "Groq API key not configured" }, 500);
+      }
+
       // Process asynchronously - don't await to return quickly to Telegram
-      handleTelegramUpdate(update, botToken, llmApiKey || "").catch((err) => {
+      handleTelegramUpdate(update, botToken, groqApiKey).catch((err) => {
         console.error("Error processing update:", err);
       });
 
-      // Return 200 OK immediately to Telegram
       return jsonResponse({ ok: true });
     } catch (error) {
       console.error("Webhook error:", error);
