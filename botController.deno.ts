@@ -5,7 +5,7 @@
 
 import { dataStore, type MessageRecord } from "./dataStore.deno.ts";
 import { generateResponse } from "./llmService.deno.ts";
-import { getLastMessages, saveInteraction } from "./kvStore.deno.ts";
+import { getLastMessages, saveInteraction, setPrompt as kvSetPrompt, getPrompt as kvGetPrompt } from "./kvStore.deno.ts";
 
 interface TelegramUser {
   id: number;
@@ -128,11 +128,55 @@ export async function handleTelegramUpdate(
     return;
   }
 
+  // ---------------- Handle /setprompt command ----------------
+  if (userText.startsWith("/setprompt")) {
+    // Usage: /setprompt <your prompt text>
+    const parts = userText.split(" ");
+    if (parts.length < 2) {
+      const usage = "Usage: /setprompt <your prompt text>";
+      await sendTelegramMessage(botToken, chatId, usage);
+      return;
+    }
+
+  // Extract the prompt text (everything after the command)
+  const promptText = userText.replace(/^\/setprompt\s+/, "").trim();
+
+  // Save the prompt in the in-memory dataStore (keep in-memory store intact)
+  dataStore.setPrompt(chatId, promptText);
+  // Persist the prompt to KV so it survives restarts (if KV available)
+  await kvSetPrompt(chatId, promptText);
+  // Acknowledge and store the prompt. Do NOT run the LLM now.
+  await sendTelegramMessage(botToken, chatId, `Prompt saved for this chat.`);
+    return;
+  }
+
+  // ---------------- Handle /getprompt command ----------------
+  if (userText === "/getprompt") {
+    const prompt = dataStore.getPrompt(chatId);
+    const reply = prompt ? `Current prompt: ${prompt}` : "No prompt set for this chat.";
+    await sendTelegramMessage(botToken, chatId, reply);
+
+    const record: MessageRecord = {
+      id: dataStore.generateId(),
+      userId,
+      username,
+      firstName,
+      text: userText,
+      response: reply,
+      timestamp: new Date().toISOString(),
+    };
+    dataStore.addMessage(record);
+    await saveInteraction(chatId, userId, username, userText, reply);
+    return;
+  }
+
   // ---------------- Generate LLM response ----------------
   let llmResult: string;
 
   try {
-    // Load last 5 messages for this chat to build the LLM context
+    // Load last 5 messages for this chat to build the LLM context.
+    // NOTE: memory is intentionally limited to the last 5 messages per chat.
+    // This keeps the LLM context small and avoids leaking long histories.
     const history = await getLastMessages(chatId, 5);
 
     // Build context in the required exact format: "User: ...\nAssistant: ..."
@@ -144,14 +188,25 @@ export async function handleTelegramUpdate(
       contextParts.push(`Assistant: ${item.botReply}`);
     }
 
-    // Append the new user message at the end per requirements
-    contextParts.push(`User: ${userText}`);
+    // If a per-chat user prompt is set, prepend it to every user message.
+    // Per the updated behavior: /setprompt stores a "user prompt" for the chat.
+    // When the user sends a normal chat message, we combine the stored prompt
+    // and the user's message into a single user entry that is sent to the LLM.
+  // Prefer persisted prompt from KV; fallback to in-memory dataStore
+  const storedPrompt = await kvGetPrompt(chatId) ?? dataStore.getPrompt(chatId);
+    const combinedUserMessage = storedPrompt && storedPrompt.trim()
+      ? `${storedPrompt}\n${userText}`
+      : userText;
+
+    // Append the combined user message at the end per requirements
+    contextParts.push(`User: ${combinedUserMessage}`);
 
     const contextString = contextParts.join("\n");
 
-    // Send the composed context to the LLM service. llmService now expects a single
-    // context string containing the history + new user message.
-    llmResult = await generateResponse(contextString);
+    // Call the LLM with the composed conversation context. We pass the full
+    // context as the user content and do not pass an extra system prompt here
+    // because the user's prompt is already embedded into the user message.
+    llmResult = await generateResponse(contextString, "");
   } catch (err) {
     console.error("❌ LLM generation failed:", err);
     llmResult = "Sorry, I'm having trouble right now. Please try again shortly.";

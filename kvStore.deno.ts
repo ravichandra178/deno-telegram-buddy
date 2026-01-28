@@ -29,6 +29,8 @@ try {
 
 // In-memory fallback: Map<chatId, ChatMemoryRecord[]>
 const memoryFallback = new Map<number, ChatMemoryRecord[]>();
+// Fallback storage for prompts when KV not available
+const promptsFallback = new Map<number, string>();
 
 function buildKey(chatId: number, timestamp: string, id: string) {
   return [CHAT_PREFIX, chatId, timestamp, id];
@@ -75,6 +77,46 @@ export async function saveInteraction(
   const start = Math.max(0, arr.length - keep);
   const sliced = arr.slice(start);
   memoryFallback.set(chatId, sliced);
+}
+
+/** Persist a per-chat prompt. If KV is available, store there; otherwise store in fallback. */
+export async function setPrompt(chatId: number, prompt: string) {
+  if (kvClient) {
+    try {
+      await kvClient.set(["prompt", chatId], prompt);
+      return;
+    } catch (e) {
+      console.warn("Deno KV setPrompt failed, falling back to memory:", e);
+      kvClient = null;
+    }
+  }
+  promptsFallback.set(chatId, prompt);
+}
+
+export async function getPrompt(chatId: number): Promise<string | null> {
+  if (kvClient) {
+    try {
+      const entry = await kvClient.get(["prompt", chatId]);
+      return entry?.value ?? null;
+    } catch (e) {
+      console.warn("Deno KV getPrompt failed, using memory fallback:", e);
+      kvClient = null;
+    }
+  }
+  return promptsFallback.get(chatId) ?? null;
+}
+
+export async function clearPrompt(chatId: number) {
+  if (kvClient) {
+    try {
+      await kvClient.delete(["prompt", chatId]);
+      return;
+    } catch (e) {
+      console.warn("Deno KV clearPrompt failed, using memory fallback:", e);
+      kvClient = null;
+    }
+  }
+  promptsFallback.delete(chatId);
 }
 
 /** Return last `limit` messages for a chat, ordered oldest -> newest */
