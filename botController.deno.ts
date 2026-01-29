@@ -5,7 +5,12 @@
 
 import { dataStore, type MessageRecord } from "./dataStore.deno.ts";
 import { generateResponse } from "./llmService.deno.ts";
-import { getLastMessages, saveInteraction, setPrompt as kvSetPrompt, getPrompt as kvGetPrompt } from "./kvStore.deno.ts";
+import {
+  getLastMessages as dbGetLastMessages,
+  saveConversation as dbSaveConversation,
+  setPrompt as dbSetPrompt,
+  getPrompt as dbGetPrompt,
+} from "./db.supabase.ts";
 
 interface TelegramUser {
   id: number;
@@ -102,9 +107,8 @@ export async function handleTelegramUpdate(
       timestamp: new Date().toISOString(),
     };
     dataStore.addMessage(record);
-    // Persist the /start interaction into KV memory as well
-    // This helps keep a consistent conversation history per chatId.
-    await saveInteraction(chatId, userId, username, userText, welcomeMessage);
+    // Persist the /start interaction into Supabase
+    await dbSaveConversation(chatId, userId, username, userText, welcomeMessage);
     return;
   }
 
@@ -123,8 +127,8 @@ export async function handleTelegramUpdate(
       timestamp: new Date().toISOString(),
     };
     dataStore.addMessage(record);
-    // Persist the /help interaction into KV memory as well
-    await saveInteraction(chatId, userId, username, userText, helpMessage);
+    // Persist the /help interaction into Supabase
+    await dbSaveConversation(chatId, userId, username, userText, helpMessage);
     return;
   }
 
@@ -138,15 +142,15 @@ export async function handleTelegramUpdate(
       return;
     }
 
-  // Extract the prompt text (everything after the command)
-  const promptText = userText.replace(/^\/setprompt\s+/, "").trim();
+    // Extract the prompt text (everything after the command)
+    const promptText = userText.replace(/^\/setprompt\s+/, "").trim();
 
-  // Save the prompt in the in-memory dataStore (keep in-memory store intact)
-  dataStore.setPrompt(chatId, promptText);
-  // Persist the prompt to KV so it survives restarts (if KV available)
-  await kvSetPrompt(chatId, promptText);
-  // Acknowledge and store the prompt. Do NOT run the LLM now.
-  await sendTelegramMessage(botToken, chatId, `Prompt saved for this chat.`);
+    // Save the prompt in the in-memory dataStore (keep in-memory store intact)
+    dataStore.setPrompt(chatId, promptText);
+    // Persist the prompt to Supabase
+    await dbSetPrompt(chatId, promptText);
+    // Acknowledge and store the prompt. Do NOT run the LLM now.
+    await sendTelegramMessage(botToken, chatId, `Prompt saved for this chat.`);
     return;
   }
 
@@ -166,7 +170,7 @@ export async function handleTelegramUpdate(
       timestamp: new Date().toISOString(),
     };
     dataStore.addMessage(record);
-    await saveInteraction(chatId, userId, username, userText, reply);
+    await dbSaveConversation(chatId, userId, username, userText, reply);
     return;
   }
 
@@ -174,26 +178,27 @@ export async function handleTelegramUpdate(
   let llmResult: string;
 
   try {
-    // Load last 5 messages for this chat to build the LLM context.
+    // Load last 5 messages for this chat from Supabase to build the LLM context.
     // NOTE: memory is intentionally limited to the last 5 messages per chat.
     // This keeps the LLM context small and avoids leaking long histories.
-    const history = await getLastMessages(chatId, 5);
+    const history = await dbGetLastMessages(chatId, 5);
 
     // Build context in the required exact format: "User: ...\nAssistant: ..."
     // Maintain chronological order (oldest -> newest)
     let contextParts: string[] = [];
     for (const item of history) {
       // Each stored record becomes two lines in the context
-      contextParts.push(`User: ${item.userMessage}`);
-      contextParts.push(`Assistant: ${item.botReply}`);
+      // Supabase uses snake_case field names
+      contextParts.push(`User: ${item.user_message}`);
+      contextParts.push(`Assistant: ${item.bot_reply}`);
     }
 
     // If a per-chat user prompt is set, prepend it to every user message.
     // Per the updated behavior: /setprompt stores a "user prompt" for the chat.
     // When the user sends a normal chat message, we combine the stored prompt
     // and the user's message into a single user entry that is sent to the LLM.
-  // Prefer persisted prompt from KV; fallback to in-memory dataStore
-  const storedPrompt = await kvGetPrompt(chatId) ?? dataStore.getPrompt(chatId);
+    // Prefer persisted prompt from Supabase; fallback to in-memory dataStore
+    const storedPrompt = await dbGetPrompt(chatId) ?? dataStore.getPrompt(chatId);
     const combinedUserMessage = storedPrompt && storedPrompt.trim()
       ? `${storedPrompt}\n${userText}`
       : userText;
@@ -232,9 +237,8 @@ export async function handleTelegramUpdate(
   };
   dataStore.addMessage(record);
 
-  // Persist the interaction into Deno KV memory (keeps last 5 messages per chat)
-  // This runs in parallel but we `await` to ensure pruning happens before next message.
-  await saveInteraction(chatId, userId, username, userText, safeMessage);
+  // Persist the interaction into Supabase (keeps last 5 messages per chat)
+  await dbSaveConversation(chatId, userId, username, userText, safeMessage);
 
   console.log(`Processed message for ${username || userId}, success: true`);
 }
