@@ -13,6 +13,11 @@
 import { handleTelegramUpdate, validateWebhookSecret } from "./botController.deno.ts";
 import { dataStore, type MessageRecord } from "./dataStore.deno.ts";
 import { getAdminStats, initDatabase } from "./db.supabase.ts";
+import {
+  handleWhatsAppWebhook,
+  handleFBMessengerWebhook,
+  handleInstagramWebhook,
+} from "./platformAdapters.deno.ts";
 
 const PORT = parseInt(Deno.env.get("PORT") || "8000");
 
@@ -111,6 +116,40 @@ async function handleRequest(request: Request): Promise<Response> {
       console.error("Webhook error:", error);
       return jsonResponse({ error: "Invalid request body" }, 400);
     }
+  }
+
+  // WhatsApp webhook (Meta) - GET for verification, POST for messages
+  if (path === "/api/whatsapp/webhook") {
+    const required = ["WHATSAPP_PHONE_ID", "WHATSAPP_ACCESS_TOKEN", "FB_VERIFY_TOKEN"];
+    const missing = required.filter((k) => !Deno.env.get(k));
+    if (missing.length > 0) {
+      // Fallback: log and return 200 so external webhook pings don't fail
+      console.warn(`WhatsApp webhook hit but missing env vars: ${missing.join(", ")}`);
+      return jsonResponse({ ok: true, warning: `WhatsApp not configured: missing ${missing.join(", ")}` }, 200);
+    }
+    return handleWhatsAppWebhook(request);
+  }
+
+  // Facebook Messenger webhook
+  if (path === "/api/fb/webhook") {
+    const required = ["FB_PAGE_ACCESS_TOKEN", "FB_VERIFY_TOKEN"];
+    const missing = required.filter((k) => !Deno.env.get(k));
+    if (missing.length > 0) {
+      console.warn(`FB webhook hit but missing env vars: ${missing.join(", ")}`);
+      return jsonResponse({ ok: true, warning: `Facebook Messenger not configured: missing ${missing.join(", ")}` }, 200);
+    }
+    return handleFBMessengerWebhook(request);
+  }
+
+  // Instagram webhook
+  if (path === "/api/ig/webhook") {
+    const required = ["IG_PAGE_ID", "IG_ACCESS_TOKEN", "FB_VERIFY_TOKEN"];
+    const missing = required.filter((k) => !Deno.env.get(k));
+    if (missing.length > 0) {
+      console.warn(`IG webhook hit but missing env vars: ${missing.join(", ")}`);
+      return jsonResponse({ ok: true, warning: `Instagram not configured: missing ${missing.join(", ")}` }, 200);
+    }
+    return handleInstagramWebhook(request);
   }
 
   // 404 for unknown routes
