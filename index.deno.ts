@@ -12,7 +12,7 @@
 
 import { handleTelegramUpdate, validateWebhookSecret } from "./botController.deno.ts";
 import { dataStore, type MessageRecord } from "./dataStore.deno.ts";
-import { getFullDB } from "./kvStore.deno.ts";
+import { getAdminStats } from "./db.supabase.ts";
 
 const PORT = parseInt(Deno.env.get("PORT") || "8000");
 
@@ -58,17 +58,16 @@ async function handleRequest(request: Request): Promise<Response> {
     return textResponse("OK");
   }
 
-  // Admin endpoint - detailed stats
+  // Admin endpoint - detailed stats from Supabase
   if (path === "/admin" && method === "GET") {
     try {
-      // Prefer KV as authoritative persistent store. If KV is unavailable,
-      // fall back to the in-memory dataStore (which will reset on cold starts).
-      const kvDb = await getFullDB();
-      if (kvDb) {
-        return jsonResponse(kvDb);
-      }
-
-      // KV not available: build admin view from in-memory dataStore
+      // Use Supabase as the authoritative persistent store
+      const adminData = await getAdminStats();
+      return jsonResponse(adminData);
+    } catch (supabaseError) {
+      console.warn("Supabase admin stats failed, falling back to in-memory:", supabaseError);
+      
+      // Fallback to in-memory dataStore if Supabase fails
       const stats = dataStore.getStats();
       const chats: Record<
         number,
