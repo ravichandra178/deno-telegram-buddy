@@ -12,9 +12,15 @@
 
 import { handleTelegramUpdate, validateWebhookSecret } from "./botController.deno.ts";
 import { dataStore, type MessageRecord } from "./dataStore.deno.ts";
-import { getAdminStats } from "./db.supabase.ts";
+import { getAdminStats, initDatabase } from "./db.supabase.ts";
 
 const PORT = parseInt(Deno.env.get("PORT") || "8000");
+
+// Initialize Supabase schema helpers (safe no-op if RPC isn't available or tables already exist)
+// NOTE: This should not block the server from starting.
+initDatabase().catch((err) => {
+  console.warn("Supabase initDatabase() failed (continuing anyway):", err);
+});
 
 // CORS headers for API calls
 const corsHeaders = {
@@ -63,46 +69,6 @@ async function handleRequest(request: Request): Promise<Response> {
     try {
       // Use Supabase as the authoritative persistent store
       const adminData = await getAdminStats();
-      return jsonResponse(adminData);
-    } catch (supabaseError) {
-      console.warn("Supabase admin stats failed, falling back to in-memory:", supabaseError);
-      
-      // Fallback to in-memory dataStore if Supabase fails
-      const stats = dataStore.getStats();
-      const chats: Record<
-        number,
-        {
-          prompt: string | null;
-          totalMessages: number;
-          recentMessages: MessageRecord[];
-        }
-      > = {};
-
-      // Build per-chat data
-      for (const msg of stats.messages) {
-        const chatId = msg.userId; // using userId as chatId
-        if (!chats[chatId]) {
-          chats[chatId] = {
-            prompt: dataStore.getPrompt(chatId), // now per-chat prompt
-            totalMessages: 0,
-            recentMessages: [],
-          };
-        }
-        chats[chatId].totalMessages += 1;
-        chats[chatId].recentMessages.push(msg);
-        // Keep only last 10 messages per chat
-        if (chats[chatId].recentMessages.length > 10) {
-          chats[chatId].recentMessages.shift();
-        }
-      }
-
-      const adminData = {
-        totalMessages: stats.totalMessages,
-        totalUsers: stats.totalUsers,
-        totalChats: Object.keys(chats).length,
-        chats,
-      };
-
       return jsonResponse(adminData);
     } catch (err) {
       console.error("Admin stats error:", err);
