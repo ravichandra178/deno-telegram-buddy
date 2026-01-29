@@ -12,6 +12,7 @@
 
 import { handleTelegramUpdate, validateWebhookSecret } from "./botController.deno.ts";
 import { dataStore, type MessageRecord } from "./dataStore.deno.ts";
+import { getFullDB } from "./kvStore.deno.ts";
 
 const PORT = parseInt(Deno.env.get("PORT") || "8000");
 
@@ -60,6 +61,14 @@ async function handleRequest(request: Request): Promise<Response> {
   // Admin endpoint - detailed stats
   if (path === "/admin" && method === "GET") {
     try {
+      // Prefer KV as authoritative persistent store. If KV is unavailable,
+      // fall back to the in-memory dataStore (which will reset on cold starts).
+      const kvDb = await getFullDB();
+      if (kvDb) {
+        return jsonResponse(kvDb);
+      }
+
+      // KV not available: build admin view from in-memory dataStore
       const stats = dataStore.getStats();
       const chats: Record<
         number,

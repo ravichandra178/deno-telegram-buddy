@@ -164,4 +164,73 @@ async function pruneOldMessagesKV(chatId: number, keep: number) {
   await Promise.all(toDelete.map((entry) => kvClient.delete(entry.key)));
 }
 
+/**
+ * Build a full DB view from KV. Returns null if KV not available so callers
+ * can fallback to in-memory dataStore.
+ */
+export async function getFullDB() {
+  if (!kvClient) return null;
+
+  try {
+    const iter = kvClient.list({ prefix: [CHAT_PREFIX] });
+    const chatsMap = new Map<number, ChatMemoryRecord[]>();
+
+    for await (const entry of iter) {
+      if (!entry?.value) continue;
+      const rec = entry.value as ChatMemoryRecord;
+      const cid = Number(rec.chatId);
+      const arr = chatsMap.get(cid) ?? [];
+      arr.push(rec);
+      chatsMap.set(cid, arr);
+    }
+
+    // load prompts
+    const prompts = new Map<number, string>();
+    try {
+      const piter = kvClient.list({ prefix: ["prompt"] });
+      for await (const p of piter) {
+        if (!p?.value) continue;
+        const key = p.key as unknown[];
+        const cid = Number(key[1]);
+        prompts.set(cid, String(p.value));
+      }
+    } catch (_e) {
+      // ignore prompt read failures
+    }
+
+    const chats: Record<string, any> = {};
+    let totalMessages = 0;
+    const users = new Set<number>();
+
+    for (const [cid, msgs] of chatsMap.entries()) {
+      // sort oldest -> newest
+      msgs.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0));
+      totalMessages += msgs.length;
+      msgs.forEach((m) => users.add(Number(m.userId)));
+
+      chats[String(cid)] = {
+        prompt: prompts.get(cid) ?? null,
+        totalMessages: msgs.length,
+        recentMessages: msgs.slice(-10).map((m) => ({
+          userId: m.userId,
+          username: m.username,
+          text: m.userMessage,
+          response: m.botReply,
+          timestamp: m.timestamp,
+        })),
+      };
+    }
+
+    return {
+      totalMessages,
+      totalUsers: users.size,
+      totalChats: chatsMap.size,
+      chats,
+    };
+  } catch (e) {
+    console.warn("getFullDB KV read failed:", e);
+    return null;
+  }
+}
+
 
