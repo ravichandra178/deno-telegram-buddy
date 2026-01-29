@@ -17,7 +17,12 @@ import {
   handleWhatsAppWebhook,
   handleFBMessengerWebhook,
   handleInstagramWebhook,
+  processIncomingMessage,
+  sendFBMessengerMessage,
 } from "./platformAdapters.deno.ts";
+import { Hmac } from "https://deno.land/std@0.200.0/hash/hmac.ts";
+import { sha256 } from "https://deno.land/std@0.200.0/hash/sha256.ts";
+import { toHex } from "https://deno.land/std@0.200.0/encoding/hex.ts";
 
 const PORT = parseInt(Deno.env.get("PORT") || "8000");
 
@@ -129,7 +134,105 @@ async function handleRequest(request: Request): Promise<Response> {
     }
     return handleWhatsAppWebhook(request);
   }
+  
+  // Unified Meta webhook for Facebook Messenger + Instagram
+  if (path === "/webhook/meta") {
+    // GET: verification
+    if (method === "GET") {
+      const url = new URL(request.url);
+      const mode = url.searchParams.get("hub.mode");
+      const verifyToken = url.searchParams.get("hub.verify_token");
+      const challenge = url.searchParams.get("hub.challenge");
+      const expected = Deno.env.get("FB_VERIFY_TOKEN") || Deno.env.get("META_VERIFY_TOKEN");
+      if (mode === "subscribe" && verifyToken && expected && verifyToken === expected) {
+        console.log("Meta webhook verified successfully");
+        return new Response(challenge ?? "", { status: 200 });
+      }
+      console.warn("Meta webhook verification failed");
+      return new Response("Forbidden", { status: 403 });
+    }
 
+    // POST: event notifications
+    if (method === "POST") {
+      // Read raw body text for signature verification
+      const rawBody = await request.text();
+
+      // Signature header
+      const signature = request.headers.get("x-hub-signature-256") || "";
+
+      const appSecret = Deno.env.get("FB_APP_SECRET") || Deno.env.get("META_APP_SECRET");
+      if (!appSecret) {
+        console.error("Meta app secret not configured (FB_APP_SECRET / META_APP_SECRET)");
+        return jsonResponse({ error: "Server misconfiguration" }, 500);
+      }
+
+      // Verify signature: header format is "sha256=..."
+      if (!signature.startsWith("sha256=")) {
+        console.warn("Missing x-hub-signature-256 header");
+        return new Response(null, { status: 403 });
+      }
+
+      try {
+        const expectedHex = signature.slice("sha256=".length);
+        const h = new Hmac(sha256, new TextEncoder().encode(appSecret));
+        h.update(new TextEncoder().encode(rawBody));
+        const digest = h.digest();
+        const computedHex = toHex(digest);
+        if (computedHex !== expectedHex) {
+          console.warn("Invalid Meta webhook signature");
+          return new Response(null, { status: 403 });
+        }
+      } catch (e) {
+        console.error("Meta signature verification error:", e);
+        return new Response(null, { status: 403 });
+      }
+
+      // Parse JSON and respond quickly per platform requirement
+      let body: any;
+      try {
+        body = JSON.parse(rawBody);
+      } catch (e) {
+        console.error("Invalid JSON payload from Meta webhook:", e);
+        return new Response(null, { status: 400 });
+      }
+
+      // If not a page event, ignore
+      if (body.object !== "page") {
+        return new Response(null, { status: 404 });
+      }
+
+      // Acknowledge immediately
+      (async () => {
+        try {
+          for (const entry of body.entry ?? []) {
+            const pageId = entry.id ?? entry?.messaging?.[0]?.recipient?.id ?? null;
+            for (const messagingEvent of entry.messaging ?? []) {
+              const senderId = messagingEvent.sender?.id ?? messagingEvent.sender?.phone_number ?? null;
+              const messageText = messagingEvent.message?.text ?? messagingEvent.message?.text?.body ?? null;
+              if (!senderId || !messageText) continue;
+
+              console.log("Meta webhook event: page=", pageId, "from=", senderId, "text=", messageText);
+
+              // Forward to shared processor using Facebook messenger sender
+              processIncomingMessage(
+                "facebook",
+                String(senderId),
+                messagingEvent.sender?.name ?? null,
+                String(messageText),
+                async (replyText: string) => await sendFBMessengerMessage(String(senderId), replyText),
+              ).catch((err) => console.error("Failed to process meta message:", err));
+            }
+          }
+        } catch (e) {
+          console.error("Error handling Meta events async:", e);
+        }
+      })();
+
+      return new Response("EVENT_RECEIVED", { status: 200 });
+    }
+
+    return new Response(null, { status: 405 });
+  }
   // Facebook Messenger webhook
   if (path === "/api/fb/webhook") {
     const required = ["FB_PAGE_ACCESS_TOKEN", "FB_VERIFY_TOKEN"];
