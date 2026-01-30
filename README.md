@@ -2,7 +2,7 @@
 
 ## Project info
 
-**URL**:
+**URL**: https://deno-telegram-buddy.mynibot.deno.net/admin
 
 # deno-telegram-buddy
 
