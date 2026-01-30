@@ -20,9 +20,32 @@ import {
   processIncomingMessage,
   sendFBMessengerMessage,
 } from "./platformAdapters.deno.ts";
-import { Hmac } from "https://deno.land/std@0.200.0/hash/hmac.ts";
-import { sha256 } from "https://deno.land/std@0.200.0/hash/sha256.ts";
-import { toHex } from "https://deno.land/std@0.200.0/encoding/hex.ts";
+// Use Web Crypto for HMAC-SHA256 to avoid external std imports that may break
+// during builds. This runs in Deno and Deno Deploy.
+
+async function verifyMetaSignature(appSecret: string, rawBody: string, signatureHeader: string): Promise<boolean> {
+  try {
+    if (!signatureHeader || !signatureHeader.startsWith("sha256=")) return false;
+    const expectedHex = signatureHeader.slice("sha256=".length);
+    const enc = new TextEncoder();
+    const keyData = enc.encode(appSecret);
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      keyData,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const signature = await crypto.subtle.sign("HMAC", cryptoKey, enc.encode(rawBody));
+    const sigBytes = new Uint8Array(signature);
+    let hex = "";
+    for (const b of sigBytes) hex += b.toString(16).padStart(2, "0");
+    return hex === expectedHex;
+  } catch (e) {
+    console.error("verifyMetaSignature error:", e);
+    return false;
+  }
+}
 
 const PORT = parseInt(Deno.env.get("PORT") || "8000");
 
@@ -143,7 +166,7 @@ async function handleRequest(request: Request): Promise<Response> {
       const mode = url.searchParams.get("hub.mode");
       const verifyToken = url.searchParams.get("hub.verify_token");
       const challenge = url.searchParams.get("hub.challenge");
-      const expected = Deno.env.get("FB_VERIFY_TOKEN") || Deno.env.get("META_VERIFY_TOKEN");
+  const expected = Deno.env.get("FB_VERIFY_TOKEN");
       if (mode === "subscribe" && verifyToken && expected && verifyToken === expected) {
         console.log("Meta webhook verified successfully");
         return new Response(challenge ?? "", { status: 200 });
@@ -160,9 +183,9 @@ async function handleRequest(request: Request): Promise<Response> {
       // Signature header
       const signature = request.headers.get("x-hub-signature-256") || "";
 
-      const appSecret = Deno.env.get("FB_APP_SECRET") || Deno.env.get("META_APP_SECRET");
+      const appSecret = Deno.env.get("FB_APP_SECRET");
       if (!appSecret) {
-        console.error("Meta app secret not configured (FB_APP_SECRET / META_APP_SECRET)");
+        console.error("Meta app secret not configured (FB_APP_SECRET)");
         return jsonResponse({ error: "Server misconfiguration" }, 500);
       }
 
@@ -173,12 +196,8 @@ async function handleRequest(request: Request): Promise<Response> {
       }
 
       try {
-        const expectedHex = signature.slice("sha256=".length);
-        const h = new Hmac(sha256, new TextEncoder().encode(appSecret));
-        h.update(new TextEncoder().encode(rawBody));
-        const digest = h.digest();
-        const computedHex = toHex(digest);
-        if (computedHex !== expectedHex) {
+        const ok = await verifyMetaSignature(appSecret, rawBody, signature);
+        if (!ok) {
           console.warn("Invalid Meta webhook signature");
           return new Response(null, { status: 403 });
         }
