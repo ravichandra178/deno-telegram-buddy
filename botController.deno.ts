@@ -12,6 +12,22 @@ import {
   getPrompt as dbGetPrompt,
 } from "./db.supabase.ts";
 
+// Cached default prompt (loaded from file on first use)
+let DEFAULT_PROMPT_CACHE: string | null = null;
+async function getDefaultPrompt(): Promise<string> {
+  if (DEFAULT_PROMPT_CACHE !== null) return DEFAULT_PROMPT_CACHE!;
+  try {
+    // Read default prompt file from repo root
+    const txt = await Deno.readTextFile(new URL("./defaultPrompt.txt", import.meta.url));
+    DEFAULT_PROMPT_CACHE = txt.trim();
+  return DEFAULT_PROMPT_CACHE!;
+  } catch (err) {
+    console.warn("defaultPrompt.txt not found or unreadable, falling back to built-in default");
+    DEFAULT_PROMPT_CACHE = "You are a helpful assistant.";
+    return DEFAULT_PROMPT_CACHE;
+  }
+}
+
 interface TelegramUser {
   id: number;
   is_bot: boolean;
@@ -206,8 +222,24 @@ export async function handleTelegramUpdate(
     // Per the updated behavior: /setprompt stores a "user prompt" for the chat.
     // When the user sends a normal chat message, we combine the stored prompt
     // and the user's message into a single user entry that is sent to the LLM.
-    // Prefer persisted prompt from Supabase; fallback to in-memory dataStore
-    const storedPrompt = await dbGetPrompt(chatId) ?? dataStore.getPrompt(chatId);
+    // Prefer persisted prompt from Supabase; fallback to in-memory dataStore.
+    // If neither exist, initialize the chat with the default prompt (persist & sync in-memory)
+    let storedPrompt = await dbGetPrompt(chatId) ?? dataStore.getPrompt(chatId);
+    if (!storedPrompt || !storedPrompt.trim()) {
+      const defaultPrompt = await getDefaultPrompt();
+      storedPrompt = defaultPrompt;
+      try {
+        await dbSetPrompt(chatId, defaultPrompt);
+      } catch (e) {
+        console.warn("Failed to persist default prompt for chat", chatId, e);
+      }
+      try {
+        dataStore.setPrompt(chatId, defaultPrompt);
+      } catch (e) {
+        console.warn("Failed to set in-memory prompt for chat", chatId, e);
+      }
+      console.log(`Initialized default prompt for chat ${chatId}`);
+    }
 
     // Enforce sensible size limits to avoid sending too-large requests to Groq
     const MAX_CONTEXT_CHARS = 3000; // safe payload size
