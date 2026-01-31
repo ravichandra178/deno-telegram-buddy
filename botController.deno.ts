@@ -199,14 +199,42 @@ export async function handleTelegramUpdate(
     // and the user's message into a single user entry that is sent to the LLM.
     // Prefer persisted prompt from Supabase; fallback to in-memory dataStore
     const storedPrompt = await dbGetPrompt(chatId) ?? dataStore.getPrompt(chatId);
-    const combinedUserMessage = storedPrompt && storedPrompt.trim()
-      ? `${storedPrompt}\n${userText}`
-      : userText;
 
-    // Append the combined user message at the end per requirements
-    contextParts.push(`User: ${combinedUserMessage}`);
+    // Enforce sensible size limits to avoid sending too-large requests to Groq
+    const MAX_CONTEXT_CHARS = 3000; // safe payload size
+    const MAX_PROMPT_CHARS = 800; // user-set prompt cap
+    const MAX_USER_INPUT_CHARS = 1000; // cap user message
 
-    const contextString = contextParts.join("\n");
+    const safeStoredPrompt = storedPrompt && storedPrompt.trim()
+      ? (storedPrompt.length > MAX_PROMPT_CHARS ? storedPrompt.slice(0, MAX_PROMPT_CHARS) : storedPrompt)
+      : null;
+
+    const safeUserText = userText.length > MAX_USER_INPUT_CHARS ? userText.slice(0, MAX_USER_INPUT_CHARS) : userText;
+
+    const combinedUserMessage = safeStoredPrompt && safeStoredPrompt.trim()
+      ? `${safeStoredPrompt}\n${safeUserText}`
+      : safeUserText;
+
+    // Append combined user message at the end per requirements
+    let contextString = contextParts.join("\n");
+    contextString = contextString ? `${contextString}\nUser: ${combinedUserMessage}` : `User: ${combinedUserMessage}`;
+
+    // If the assembled context is too large, drop oldest exchanges until it fits
+    if (contextString.length > MAX_CONTEXT_CHARS) {
+      console.warn(`Context length ${contextString.length} exceeds ${MAX_CONTEXT_CHARS}, trimming oldest history`);
+      // Remove oldest user+assistant pairs (2 entries in contextParts) until under limit
+      while (contextString.length > MAX_CONTEXT_CHARS && contextParts.length >= 2) {
+        contextParts.splice(0, 2);
+        contextString = contextParts.join("\n");
+        contextString = contextString ? `${contextString}\nUser: ${combinedUserMessage}` : `User: ${combinedUserMessage}`;
+      }
+
+      // If still too large, truncate from the start keeping the latest characters
+      if (contextString.length > MAX_CONTEXT_CHARS) {
+        contextString = `...(truncated)\n${contextString.slice(-MAX_CONTEXT_CHARS)}`;
+        console.warn("Context truncated by character length to fit payload");
+      }
+    }
 
     // Call the LLM with the composed conversation context. We pass the full
     // context as the user content and do not pass an extra system prompt here
