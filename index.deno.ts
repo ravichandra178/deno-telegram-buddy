@@ -1,5 +1,5 @@
 /**
- * Telegram Bot Backend - Main Deno Server
+import { getAdminStats, initDatabase, setPrompt as dbSetPrompt } from "./db.supabase.ts";
  * 
  * Endpoints:
  * - POST /api/telegram/webhook - Telegram webhook handler
@@ -80,6 +80,16 @@ function textResponse(text: string, status = 200): Response {
       "Content-Type": "text/plain",
     },
   });
+}
+
+// Small helper to escape HTML in the admin UI
+function escapeHtml(str: string) {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 async function handleRequest(request: Request): Promise<Response> {

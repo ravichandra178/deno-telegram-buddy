@@ -156,7 +156,16 @@ export async function handleTelegramUpdate(
 
   // ---------------- Handle /getprompt command ----------------
   if (userText === "/getprompt") {
-    const prompt = dataStore.getPrompt(chatId);
+    // Prefer the persisted prompt from Supabase, fallback to in-memory store
+    const persistedPrompt = await dbGetPrompt(chatId);
+    const prompt = persistedPrompt ?? dataStore.getPrompt(chatId);
+
+    // If persisted prompt exists but in-memory doesn't, sync it so future
+    // interactions during this process run will use the same prompt (GEM behavior)
+    if (persistedPrompt && !dataStore.getPrompt(chatId)) {
+      dataStore.setPrompt(chatId, persistedPrompt);
+    }
+
     const reply = prompt ? `Current prompt: ${prompt}` : "No prompt set for this chat.";
     await sendTelegramMessage(botToken, chatId, reply);
 
