@@ -1,18 +1,19 @@
 /**
-import { getAdminStats, initDatabase, setPrompt as dbSetPrompt } from "./db.supabase.ts";
- * 
+ * Telegram Bot Backend - Main Deno Server
+ *
  * Endpoints:
  * - POST /api/telegram/webhook - Telegram webhook handler
  * - GET /admin - Admin dashboard data
  * - GET /health - Health check
- * 
+ * - GET /             - Admin UI to edit per-chat prompts
+ *
  * Run: deno run -A index.deno.ts
  * Deploy: Compatible with Deno Deploy
  */
 
 import { handleTelegramUpdate, validateWebhookSecret } from "./botController.deno.ts";
 import { dataStore, type MessageRecord } from "./dataStore.deno.ts";
-import { getAdminStats, initDatabase } from "./db.supabase.ts";
+import { getAdminStats, initDatabase, setPrompt as dbSetPrompt } from "./db.supabase.ts";
 import {
   handleWhatsAppWebhook,
   handleFBMessengerWebhook,
@@ -116,6 +117,83 @@ async function handleRequest(request: Request): Promise<Response> {
     } catch (err) {
       console.error("Admin stats error:", err);
       return jsonResponse({ error: "Failed to retrieve admin stats" }, 500);
+    }
+  }
+
+  // Simple web UI at root to edit per-chat prompts
+  if (path === "/" && method === "GET") {
+    try {
+      const stats = await getAdminStats();
+
+      // Build a minimal HTML page with a form per chat to edit prompts
+      const rows = Object.entries(stats.chats).map(([chatId, info]) => {
+        const prompt = (info as any).prompt ?? "";
+        return `
+          <tr>
+            <td>${chatId}</td>
+            <td><textarea rows="3" cols="60" id="prompt-${chatId}">${escapeHtml(String(prompt))}</textarea></td>
+            <td><button onclick="savePrompt(${chatId})">Save</button></td>
+          </tr>
+        `;
+      }).join("\n");
+
+      const html = `
+        <!doctype html>
+        <html>
+        <head>
+          <meta charset="utf-8" />
+          <title>Prompts Admin</title>
+        </head>
+        <body>
+          <h1>Per-chat Prompts</h1>
+          <table border="1" cellpadding="6">
+            <thead><tr><th>Chat ID</th><th>Prompt</th><th>Action</th></tr></thead>
+            <tbody>
+              ${rows}
+            </tbody>
+          </table>
+
+          <script>
+            async function savePrompt(chatId) {
+              const el = document.getElementById('prompt-' + chatId);
+              const prompt = el ? el.value : '';
+              const res = await fetch('/admin/set-prompt', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chatId, prompt })
+              });
+              const data = await res.json();
+              if (data.ok) alert('Saved'); else alert('Save failed');
+            }
+          </script>
+        </body>
+        </html>
+      `;
+
+      return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html' } });
+    } catch (err) {
+      console.error('Admin UI error:', err);
+      return jsonResponse({ error: 'Failed to render admin UI' }, 500);
+    }
+  }
+
+  // API: set prompt for a chat (syncs to Supabase and in-memory store)
+  if (path === '/admin/set-prompt' && method === 'POST') {
+    try {
+      const body = await request.json();
+      const chatId = Number(body.chatId);
+      const prompt = String(body.prompt ?? '');
+
+      if (isNaN(chatId)) return jsonResponse({ error: 'Invalid chatId' }, 400);
+
+      await dbSetPrompt(chatId, prompt);
+      // Sync into in-memory store so it's used immediately
+      dataStore.setPrompt(chatId, prompt);
+
+      return jsonResponse({ ok: true });
+    } catch (err) {
+      console.error('Set prompt error:', err);
+      return jsonResponse({ error: 'Failed to save prompt' }, 500);
     }
   }
 
